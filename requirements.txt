@@ -1,0 +1,4 @@
+pykrx
+pandas
+fpdf2
+matplotlib
