@@ -2,6 +2,8 @@
 
 KRX 상장 액티브 ETF의 구성 종목을 분석하고, 전일 대비 변동을 추적하여 PDF 리포트를 생성하는 도구
 
+> **Claude 작업 지침**: 기능이 추가되거나 삭제될 때 반드시 이 문서를 업데이트할 것
+
 ## 프로젝트 구조
 
 ```
@@ -10,10 +12,10 @@ stock_ws/
 ├── config.py            # 설정 파일 (경로, 필터링 조건, 폰트 등)
 ├── requirements.txt     # 의존성: pykrx, pandas, fpdf2, matplotlib
 ├── modules/
-│   ├── data_fetcher.py  # pykrx로 ETF 데이터 수집 (티커, 구성종목, 수익률)
+│   ├── data_fetcher.py  # pykrx로 ETF 데이터 수집 (티커, 구성종목, 수익률) + 캐싱
 │   ├── analyzer.py      # 구성 종목 비중 분석 (컨센서스 계산, 변동 추적)
 │   └── report_generator.py  # PDF 리포트 및 차트 생성
-├── data/                # 일별 분석 결과 CSV (YYYYMMDD.csv)
+├── data/                # 일별 분석 결과 CSV + 캐시 파일
 └── reports/             # PDF 리포트 및 차트 이미지
 ```
 
@@ -65,9 +67,41 @@ python main.py --min-returns 5    # 최소 5% 이상 수익률 필터
 - **fpdf2**: PDF 생성
 - **matplotlib**: 차트 생성
 
+## 캐싱 (data_fetcher.py)
+
+API 호출 결과를 `data/` 폴더에 캐시하여 재실행 시 속도 향상
+
+| 함수 | 캐시 파일 | 형식 |
+|------|----------|------|
+| `get_target_etfs()` | `cache_{날짜}_target_etfs_min{최소수익률}_top{N}.json` | JSON |
+| `get_etf_holdings()` | `cache_{날짜}_holdings_{티커}.csv` | CSV |
+| `get_etf_info()` | `cache_{날짜}_etf_info_{해시}.csv` | CSV |
+
+## PDF 리포트 구성 (report_generator.py)
+
+1. **Analysis Target ETF Overview** - 분석 대상 ETF 현황
+2. **Consensus Holdings Top N** - 합산 보유 비중 상위 종목
+3. **Weight Increase Top N** - 비중 급증 종목 (기존 보유 중)
+4. **Weight Decrease Top N** - 비중 급감 종목 (기존 보유 중)
+5. **ETF Returns Comparison** - 3개월 수익률 비교 차트
+
 ## 코드 컨벤션
 
 - 한글 주석 사용 (`[Step N]`, `[설명]` 형태)
 - 로깅: `logging` 모듈 사용
 - 날짜 형식: `YYYYMMDD` 문자열
 - DataFrame 컬럼: PascalCase (StockName, TotalWeight 등)
+
+---
+
+## Claude 작업 지침
+
+**기능 추가/삭제/수정 시 이 문서에 반영해야 할 항목:**
+
+1. **프로젝트 구조**: 파일 추가/삭제 시 트리 업데이트
+2. **주요 워크플로우**: 실행 흐름 변경 시 업데이트
+3. **핵심 개념**: 새로운 용어/개념 추가 시 설명 추가
+4. **설정**: config.py 변수 추가/삭제 시 테이블 업데이트
+5. **캐싱**: 캐시 파일 형식 변경 시 테이블 업데이트
+6. **PDF 리포트 구성**: 섹션 추가/삭제 시 목록 업데이트
+7. **의존성**: 새 라이브러리 추가 시 목록 업데이트

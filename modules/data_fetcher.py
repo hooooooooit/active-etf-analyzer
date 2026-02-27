@@ -1,7 +1,9 @@
 """
 pykrx를 이용한 ETF 데이터 수집 모듈
+[캐싱 지원: 한 번 조회한 데이터는 data/ 폴더에 저장하여 재사용]
 """
 import time
+import json
 import logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
@@ -11,9 +13,67 @@ from pykrx import stock
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from config import MAX_RETRIES, RETRY_DELAY, MIN_RETURNS_3M, TOP_N_RETURNS, LOOKBACK_DAYS
+from config import MAX_RETRIES, RETRY_DELAY, MIN_RETURNS_3M, TOP_N_RETURNS, LOOKBACK_DAYS, DATA_DIR
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# 캐시 유틸리티 함수
+# ============================================================
+
+def _get_cache_path(date: str, cache_type: str, suffix: str = None) -> Path:
+    """캐시 파일 경로 생성"""
+    DATA_DIR.mkdir(exist_ok=True)
+    if suffix:
+        return DATA_DIR / f"cache_{date}_{cache_type}_{suffix}.csv"
+    return DATA_DIR / f"cache_{date}_{cache_type}.csv"
+
+
+def _load_cache_csv(cache_path: Path) -> Optional[pd.DataFrame]:
+    """CSV 캐시 파일 로드"""
+    if cache_path.exists():
+        try:
+            df = pd.read_csv(cache_path, encoding='utf-8-sig')
+            logger.info(f"캐시 로드: {cache_path.name}")
+            return df
+        except Exception as e:
+            logger.debug(f"캐시 로드 실패: {e}")
+    return None
+
+
+def _save_cache_csv(df: pd.DataFrame, cache_path: Path):
+    """DataFrame을 CSV 캐시로 저장"""
+    try:
+        df.to_csv(cache_path, index=False, encoding='utf-8-sig')
+        logger.info(f"캐시 저장: {cache_path.name}")
+    except Exception as e:
+        logger.debug(f"캐시 저장 실패: {e}")
+
+
+def _load_cache_json(cache_path: Path) -> Optional[dict]:
+    """JSON 캐시 파일 로드"""
+    json_path = cache_path.with_suffix('.json')
+    if json_path.exists():
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            logger.info(f"캐시 로드: {json_path.name}")
+            return data
+        except Exception as e:
+            logger.debug(f"캐시 로드 실패: {e}")
+    return None
+
+
+def _save_cache_json(data: dict, cache_path: Path):
+    """dict를 JSON 캐시로 저장"""
+    json_path = cache_path.with_suffix('.json')
+    try:
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        logger.info(f"캐시 저장: {json_path.name}")
+    except Exception as e:
+        logger.debug(f"캐시 저장 실패: {e}")
 
 
 def _retry_api_call(func, *args, **kwargs):
@@ -41,6 +101,7 @@ def get_target_etfs(
     """
     분석 대상 액티브 ETF 티커 목록 추출
     [3개월 수익률 기준 필터링 - 최적화 버전]
+    [캐싱 지원: 동일 날짜/설정의 결과 재사용]
 
     Args:
         min_returns: 최소 수익률 기준 (%)
@@ -52,6 +113,18 @@ def get_target_etfs(
     """
     if date is None:
         date = datetime.now().strftime("%Y%m%d")
+
+    # [캐시 확인]
+    cache_path = _get_cache_path(date, f"target_etfs_min{min_returns}_top{top_n}")
+    cached_data = _load_cache_json(cache_path)
+    if cached_data:
+        logger.info(f"캐시에서 타겟 ETF 로드: {len(cached_data['tickers'])}개")
+        # 캐시된 ETF 목록 출력
+        for e in cached_data['etf_returns'][:10]:
+            logger.info(f"  - {e['ticker']} {e['name']}: {e['returns_3m']:+.2f}%")
+        if len(cached_data['etf_returns']) > 10:
+            logger.info(f"  ... 외 {len(cached_data['etf_returns']) - 10}개")
+        return cached_data['tickers']
 
     logger.info(f"ETF 티커 목록 조회 중... (기준일: {date})")
 
@@ -122,12 +195,21 @@ def get_target_etfs(
     if len(etf_returns) > 10:
         logger.info(f"  ... 외 {len(etf_returns) - 10}개")
 
+    # [캐시 저장]
+    _save_cache_json({
+        'tickers': target_tickers,
+        'etf_returns': etf_returns,
+        'min_returns': min_returns,
+        'top_n': top_n
+    }, cache_path)
+
     return target_tickers
 
 
 def get_etf_holdings(ticker: str, date: str = None) -> Optional[pd.DataFrame]:
     """
     개별 ETF의 구성 종목 및 비중 조회
+    [캐싱 지원: 동일 날짜/티커의 구성종목 재사용]
 
     Args:
         ticker: ETF 티커
@@ -138,6 +220,12 @@ def get_etf_holdings(ticker: str, date: str = None) -> Optional[pd.DataFrame]:
     """
     if date is None:
         date = datetime.now().strftime("%Y%m%d")
+
+    # [캐시 확인]
+    cache_path = _get_cache_path(date, "holdings", ticker)
+    cached_df = _load_cache_csv(cache_path)
+    if cached_df is not None and not cached_df.empty:
+        return cached_df
 
     try:
         # [PDF(구성종목) 데이터 조회]
@@ -156,6 +244,9 @@ def get_etf_holdings(ticker: str, date: str = None) -> Optional[pd.DataFrame]:
         if 'index' in df.columns:
             df = df.rename(columns={'index': '종목코드'})
 
+        # [캐시 저장]
+        _save_cache_csv(df, cache_path)
+
         return df
 
     except Exception as e:
@@ -166,6 +257,7 @@ def get_etf_holdings(ticker: str, date: str = None) -> Optional[pd.DataFrame]:
 def get_etf_info(tickers: List[str], date: str = None) -> pd.DataFrame:
     """
     ETF 기본 정보 조회 (수익률, 거래량 등)
+    [캐싱 지원: 동일 날짜/티커 목록의 ETF 정보 재사용]
 
     Args:
         tickers: ETF 티커 리스트
@@ -176,6 +268,16 @@ def get_etf_info(tickers: List[str], date: str = None) -> pd.DataFrame:
     """
     if date is None:
         date = datetime.now().strftime("%Y%m%d")
+
+    # [캐시 확인 - 티커 목록의 해시를 사용]
+    tickers_hash = hash(tuple(sorted(tickers))) % 100000
+    cache_path = _get_cache_path(date, f"etf_info_{tickers_hash}")
+    cached_df = _load_cache_csv(cache_path)
+    if cached_df is not None and not cached_df.empty:
+        # 캐시된 티커가 요청된 티커와 일치하는지 확인
+        cached_tickers = set(cached_df['Ticker'].tolist())
+        if set(tickers) == cached_tickers:
+            return cached_df
 
     # [수익률 데이터 미리 조회]
     end_dt = datetime.strptime(date, "%Y%m%d")
@@ -224,4 +326,10 @@ def get_etf_info(tickers: List[str], date: str = None) -> pd.DataFrame:
             logger.debug(f"{ticker} 정보 조회 실패: {e}")
             continue
 
-    return pd.DataFrame(etf_data)
+    result_df = pd.DataFrame(etf_data)
+
+    # [캐시 저장]
+    if not result_df.empty:
+        _save_cache_csv(result_df, cache_path)
+
+    return result_df
