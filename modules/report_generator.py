@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 from fpdf import FPDF
 
 import sys
-sys.path.insert(0, str(__file__).rsplit('/', 2)[0])
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import REPORT_DIR, TOP_N, FONT_CANDIDATES
 
 logger = logging.getLogger(__name__)
@@ -23,18 +23,48 @@ def _setup_korean_font():
     [한글 폰트 설정 - matplotlib]
     시스템에 설치된 폰트 중 사용 가능한 한글 폰트 선택
     """
+    import os
     import matplotlib.font_manager as fm
 
-    # [시스템 폰트 목록에서 한글 폰트 검색]
+    # [폰트 경로 직접 탐색 - 우선순위 순]
+    font_paths = [
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        "/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf",
+        "/usr/share/fonts/truetype/nanum/NanumGothicCoding.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/nanum/NanumGothic.ttf",
+        "C:/Windows/Fonts/NanumGothic.ttf",
+        "C:/Windows/Fonts/malgun.ttf",
+        os.path.expanduser("~/.fonts/NanumGothic.ttf"),
+    ]
+
     font_found = False
-    for font_name in FONT_CANDIDATES:
-        fonts = [f for f in fm.fontManager.ttflist if font_name in f.name]
-        if fonts:
-            plt.rcParams['font.family'] = font_name
-            plt.rcParams['axes.unicode_minus'] = False
-            logger.info(f"한글 폰트 설정: {font_name}")
-            font_found = True
-            break
+    for font_path in font_paths:
+        if os.path.exists(font_path):
+            try:
+                # [폰트 파일을 직접 등록]
+                fm.fontManager.addfont(font_path)
+                font_prop = fm.FontProperties(fname=font_path)
+                font_name = font_prop.get_name()
+                plt.rcParams['font.family'] = font_name
+                plt.rcParams['axes.unicode_minus'] = False
+                logger.info(f"한글 폰트 설정: {font_path}")
+                font_found = True
+                break
+            except Exception as e:
+                logger.debug(f"폰트 설정 실패 ({font_path}): {e}")
+                continue
+
+    if not font_found:
+        # [fontManager에서 한글 폰트 검색]
+        for font_name in FONT_CANDIDATES:
+            fonts = [f for f in fm.fontManager.ttflist if font_name in f.name]
+            if fonts:
+                plt.rcParams['font.family'] = font_name
+                plt.rcParams['axes.unicode_minus'] = False
+                logger.info(f"한글 폰트 설정: {font_name}")
+                font_found = True
+                break
 
     if not font_found:
         logger.warning("한글 폰트를 찾을 수 없습니다. 기본 폰트 사용")
@@ -104,11 +134,12 @@ class KoreanPDF(FPDF):
         """
         import os
 
-        # [일반적인 폰트 경로]
+        # [일반적인 폰트 경로 - 우선순위 순]
         font_paths = [
             "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+            "/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf",
+            "/usr/share/fonts/truetype/nanum/NanumGothicCoding.ttf",
             "/usr/share/fonts/nanum/NanumGothic.ttf",
-            "/usr/share/fonts/truetype/nanum-coding/NanumGothicCoding.ttf",
             "C:/Windows/Fonts/NanumGothic.ttf",
             "C:/Windows/Fonts/malgun.ttf",
             os.path.expanduser("~/.fonts/NanumGothic.ttf"),
@@ -191,16 +222,31 @@ def generate_pdf(
 
     # [Table 3: 비중 증가 Top 10]
     pdf.set_font(pdf.font_name, size=12)
-    pdf.cell(0, 8, f'3. Weight Change Top {TOP_N}', ln=True)
+    pdf.cell(0, 8, f'3. Weight Increase Top {TOP_N} (Maintain)', ln=True)
     pdf.ln(3)
 
-    top_changes = diff_df[diff_df['Weight_Diff'] > 0].head(TOP_N)
-    _add_diff_table(pdf, top_changes)
+    # 기존 보유 종목 중 비중 증가
+    top_increases = diff_df[
+        (diff_df['Status'] == 'Maintain') & (diff_df['Weight_Diff'] > 0)
+    ].sort_values('Weight_Diff', ascending=False).head(TOP_N)
+    _add_diff_table(pdf, top_increases)
+    pdf.ln(10)
+
+    # [Table 4: 비중 감소 Top 10]
+    pdf.set_font(pdf.font_name, size=12)
+    pdf.cell(0, 8, f'4. Weight Decrease Top {TOP_N} (Maintain)', ln=True)
+    pdf.ln(3)
+
+    # 기존 보유 종목 중 비중 감소
+    top_decreases = diff_df[
+        (diff_df['Status'] == 'Maintain') & (diff_df['Weight_Diff'] < 0)
+    ].sort_values('Weight_Diff', ascending=True).head(TOP_N)
+    _add_diff_table(pdf, top_decreases)
 
     # [Chart: ETF 수익률 비교]
     pdf.add_page()
     pdf.set_font(pdf.font_name, size=12)
-    pdf.cell(0, 8, '4. ETF Returns Comparison', ln=True)
+    pdf.cell(0, 8, '5. ETF Returns Comparison', ln=True)
     pdf.ln(5)
 
     chart_path = _create_returns_chart(etf_info, date)

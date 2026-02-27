@@ -8,7 +8,7 @@ from typing import Optional, Tuple, List
 import pandas as pd
 
 import sys
-sys.path.insert(0, str(__file__).rsplit('/', 2)[0])
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import DATA_DIR, TOP_N
 
 logger = logging.getLogger(__name__)
@@ -221,3 +221,41 @@ def get_new_entries(diff_df: pd.DataFrame) -> pd.DataFrame:
 def get_exits(diff_df: pd.DataFrame) -> pd.DataFrame:
     """제외 종목"""
     return diff_df[diff_df['Status'] == 'Out'].copy()
+
+
+def get_top_weight_increases(diff_df: pd.DataFrame, n: int = TOP_N) -> pd.DataFrame:
+    """
+    비중이 급격히 증가한 종목 추출 (신규 편입 제외, 기존 보유 종목 중)
+
+    Args:
+        diff_df: 비중 변동 분석 결과
+        n: 상위 N개
+
+    Returns:
+        비중 증가 상위 종목 DataFrame
+    """
+    # 기존 보유 종목 중 비중이 증가한 종목만 (신규 편입 제외)
+    increases = diff_df[
+        (diff_df['Status'] == 'Maintain') &
+        (diff_df['Weight_Diff'] > 0)
+    ].sort_values('Weight_Diff', ascending=False)
+    return increases.head(n).copy()
+
+
+def get_top_weight_decreases(diff_df: pd.DataFrame, n: int = TOP_N) -> pd.DataFrame:
+    """
+    비중이 급격히 감소한 종목 추출 (제외 종목 제외, 기존 보유 종목 중)
+
+    Args:
+        diff_df: 비중 변동 분석 결과
+        n: 상위 N개
+
+    Returns:
+        비중 감소 상위 종목 DataFrame
+    """
+    # 기존 보유 종목 중 비중이 감소한 종목만 (완전 제외 제외)
+    decreases = diff_df[
+        (diff_df['Status'] == 'Maintain') &
+        (diff_df['Weight_Diff'] < 0)
+    ].sort_values('Weight_Diff', ascending=True)
+    return decreases.head(n).copy()

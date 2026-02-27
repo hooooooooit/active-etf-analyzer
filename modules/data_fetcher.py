@@ -9,7 +9,8 @@ import pandas as pd
 from pykrx import stock
 
 import sys
-sys.path.insert(0, str(__file__).rsplit('/', 2)[0])
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import MAX_RETRIES, RETRY_DELAY, MIN_RETURNS_3M, TOP_N_RETURNS, LOOKBACK_DAYS
 
 logger = logging.getLogger(__name__)
