@@ -16,6 +16,8 @@ stock_ws/
 │   ├── analyzer.py      # 구성 종목 비중 분석 (컨센서스 계산, 변동 추적)
 │   └── report_generator.py  # PDF 리포트 및 차트 생성
 ├── data/                # 일별 분석 결과 CSV + 캐시 파일
+│   ├── pykrx_readme.md  # pykrx 전체 문서 (25,000+ 토큰, 직접 읽지 말 것)
+│   └── pykrx_api_index.md  # API 인덱스 (이것부터 참조)
 └── reports/             # PDF 리포트 및 차트 이미지
 ```
 
@@ -95,6 +97,41 @@ API 호출 결과를 `data/` 폴더에 캐시하여 재실행 시 속도 향상
 ---
 
 ## Claude 작업 지침
+
+### 작업 시작 전 필수 사항
+
+**pykrx API 문서 최신화** (하루 1회)
+
+작업 시작 전 `data/pykrx_readme.md` 파일의 최신화 여부를 확인하고, 당일 최신화 이력이 없으면 GitHub에서 최신 문서를 가져와 업데이트할 것.
+
+1. `data/pykrx_readme.md` 파일 상단의 `last_updated` 날짜 확인
+2. 당일 날짜와 다르면 https://github.com/sharebook-kr/pykrx 의 README.md를 WebFetch로 가져와 `data/pykrx_readme.md` 업데이트
+3. 파일 상단에 아래 형식으로 최신화 날짜 기록:
+   ```
+   <!-- last_updated: YYYYMMDD -->
+   ```
+4. 당일 이미 최신화된 경우 스킵
+
+**pykrx API 참조 방법**
+
+전체 문서(`data/pykrx_readme.md`)는 25,000+ 토큰이므로 전체를 읽지 말 것.
+
+1. **인덱스 먼저 확인**: `data/pykrx_api_index.md`에서 필요한 API의 라인 위치 확인
+2. **해당 부분만 읽기**: `Read data/pykrx_readme.md --offset {라인} --limit 30`
+3. **검색 활용**: `Grep "get_etf_portfolio" data/pykrx_readme.md`
+
+```
+# 현재 프로젝트에서 사용 중인 API
+stock.get_etf_ticker_list(date)              # ETF 티커 목록
+stock.get_etf_ticker_name(ticker)            # ETF 이름
+stock.get_etf_ohlcv_by_date(start, end, ticker)  # ETF OHLCV
+stock.get_etf_price_change_by_ticker(start, end) # 전종목 등락률
+stock.get_etf_portfolio_deposit_file(ticker, date) # PDF(구성종목)
+```
+
+---
+
+### 문서 유지보수
 
 **기능 추가/삭제/수정 시 이 문서에 반영해야 할 항목:**
 
