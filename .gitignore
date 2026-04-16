@@ -11,3 +11,4 @@ data/cache_*.json
 data/yf_ticker_cache.json
 data/20*.csv
 reports/
+logs/

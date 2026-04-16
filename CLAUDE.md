@@ -8,15 +8,18 @@ KRX 상장 equity 액티브 ETF(AUM 상위, 매일 동적 선정)의 **전 영�
 
 ```
 stock_ws/
-├── main.py                    # 메인 실행 (6단계 워크플로우)
+├── main.py                    # 메인 실행 (7단계 워크플로우: 분석 + 캐시 정리)
 ├── config.py                  # 선정 파라미터, 제외 키워드, 임계값, Slack/KRX 자격증명
 ├── requirements.txt           # pykrx, pandas, requests, python-dotenv, yfinance
+├── run.sh                     # cron 실행용 래퍼 (venv 활성화 + 로그 + 실행)
 ├── .env.example               # SLACK_WEBHOOK_URL, KRX_USER_ID, KRX_PASSWORD
 ├── modules/
 │   ├── business_day.py        # pykrx 기반 영업일 탐색
 │   ├── data_fetcher.py        # KRX 로그인 + 전종목 snapshot + 동적 ETF 선정 + 구성종목 수집(+비중 재계산+해외종목 yfinance 보강) + 캐싱 + 신규 상장 감지
 │   ├── analyzer.py            # ETF별 diff + 공통 시그널 집계
+│   ├── cache_cleaner.py       # 오래된 캐시 파일 자동 정리 (날짜 기반)
 │   └── slack_notifier.py      # Block Kit 렌더 + webhook POST (신규 상장 섹션 포함)
+├── logs/                      # cron 실행 로그 (자동 생성, 30일 보관)
 └── data/                      # ETF별 일자별 홀딩 캐시 + 전종목 snapshot 캐시
     ├── ticker_map.json        # 해외종목 수동 매핑 (yfinance Search 실패분)
     ├── yf_ticker_cache.json   # yfinance 티커 검색 결과 캐시 (자동 축적)
@@ -39,6 +42,19 @@ python main.py --dry-run
 
 휴일(주말/공휴일)에 실행되면 영업일 2일을 찾지 못해 **조용히 exit 0** (Slack 전송 없음).
 
+### cron 스케줄링 (매일 09:00)
+
+```bash
+# crontab -e 로 등록
+# 평일만 실행 (1-5 = 월~금)
+0 9 * * 1-5 /path/to/active-etf-analyzer/run.sh
+
+# 또는 매일 실행 (휴일은 main.py가 자동 스킵하므로 매일 돌려도 무방)
+0 9 * * * /path/to/active-etf-analyzer/run.sh
+```
+
+`run.sh`가 처리하는 것: venv 자동 활성화, `logs/` 디렉토리에 실행 로그 기록 (30일 보관), `.env`는 `config.py`에서 절대경로로 로드하므로 cron 환경에서도 정상 동작.
+
 ## 주요 워크플로우 (main.py)
 
 1. 기준일 이전 최근 영업일 2개 탐색 (D-1, D-2) — 부족하면 휴일 스킵
@@ -47,6 +63,7 @@ python main.py --dry-run
 4. 대상 ETF에 대해 D-1, D-2 구성종목 수집 + 신규 상장 ETF의 D-1 구성종목 수집 (캐시 활용)
 5. ETF별 비중 diff 계산 (`New/Out/Up/Down/Flat`) + 공통 시그널 집계 (N개 이상 ETF에서 동시 증가/신규 편입)
 6. Block Kit 메시지 조립 (신규 상장 섹션 + 공통 시그널 + ETF별 diff) → Slack Incoming Webhook POST
+7. **오래된 캐시 자동 정리** — `CACHE_KEEP_DAYS`(기본 7일) 이전의 `cache_*.csv` 파일 삭제
 
 ## 핵심 개념
 
@@ -75,6 +92,7 @@ python main.py --dry-run
 | `COMMON_SIGNAL_MIN_ETFS` | 3 | 공통 시그널 인정 최소 ETF 수 |
 | `MAX_CHANGES_PER_ETF` | 5 | Slack 메시지에 ETF당 표시할 카테고리별 종목 수 |
 | `NEW_LISTING_TOP_N` | 10 | 신규 상장 ETF 섹션에 표시할 상위 종목 수 |
+| `CACHE_KEEP_DAYS` | 7 | 캐시 파일 보관 일수 (이전 파일 자동 삭제) |
 | `MAX_RETRIES` / `RETRY_DELAY` | 3 / 1 | API 재시도 |
 
 ## 환경변수 (.env)
@@ -100,6 +118,7 @@ python main.py --dry-run
 | `_fetch_etf_full_snapshot(date)` | `data/cache_{date}_etf_snapshot.csv` | CSV (전종목 MKTCAP/ACC_TRDVAL/LIST_SHRS 포함, 동적 선정·신규 상장 감지용) |
 | `_resolve_yahoo_tickers()` | `data/yf_ticker_cache.json` | JSON (종목명→Yahoo 티커, 영구) |
 | (수동 매핑) | `data/ticker_map.json` | JSON (yfinance Search 실패 종목 ~9개) |
+| `cleanup_old_cache()` | `data/cache_*` 중 오래된 파일 삭제 | `CACHE_KEEP_DAYS`(7일) 기준, 파일명의 날짜로 판별 |
 
 ## Slack 메시지 구성 (slack_notifier.py)
 

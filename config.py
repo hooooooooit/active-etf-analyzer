@@ -33,6 +33,9 @@ COMMON_SIGNAL_MIN_ETFS = 3     # N개 이상 ETF에서 동시 매수/신규 편�
 MAX_CHANGES_PER_ETF = 5        # ETF당 표시할 최대 변화 종목 수 (카테고리별)
 NEW_LISTING_TOP_N = 10         # 신규 상장 ETF 섹션에 표시할 상위 종목 수
 
+# [캐시 관리]
+CACHE_KEEP_DAYS = 7            # 캐시 파일 보관 일수 (이전 파일 자동 삭제)
+
 # [재시도 설정]
 MAX_RETRIES = 3                # API 호출 최대 재시도 횟수
 RETRY_DELAY = 1                # 재시도 간 대기 시간 (초)

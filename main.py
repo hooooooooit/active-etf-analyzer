@@ -25,6 +25,7 @@ from modules.data_fetcher import (
     find_newly_listed_active_etfs,
 )
 from modules.analyzer import analyze_all_etfs, find_common_signals
+from modules.cache_cleaner import cleanup_old_cache
 from modules.daily_drop_analyzer import get_kospi_drop_stats
 from modules.slack_notifier import build_blocks, send_to_slack
 
@@ -114,6 +115,10 @@ def main(date_arg: str = None, dry_run: bool = False) -> int:
         return 0
 
     success = send_to_slack(SLACK_WEBHOOK_URL, blocks)
+
+    # [Step 7] 오래된 캐시 정리 (7일 이전)
+    cleanup_old_cache()
+
     return 0 if success else 1
 
 
