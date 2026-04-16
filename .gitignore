@@ -5,6 +5,9 @@ __pycache__/
 .venv/
 venv/
 
-# 데이터 및 리포트 (선택적으로 포함 가능)
-# data/
-# reports/
+# 캐시 데이터 (일별 자동 생성)
+data/cache_*.csv
+data/cache_*.json
+data/yf_ticker_cache.json
+data/20*.csv
+reports/

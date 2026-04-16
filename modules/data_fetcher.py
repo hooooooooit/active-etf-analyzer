@@ -1,335 +1,531 @@
 """
 pykrx를 이용한 ETF 데이터 수집 모듈
-[캐싱 지원: 한 번 조회한 데이터는 data/ 폴더에 저장하여 재사용]
+
+- KRX 로그인 (ETF API는 2026-02-27 이후 인증 필수)
+- ETF 구성종목(PDF) 조회 + 비중 재계산
+- 조회 결과는 data/cache_{date}_holdings_{ticker}.csv 로 캐싱
 """
 import time
 import json
+import re
 import logging
-from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Tuple
+from datetime import timedelta
+from pathlib import Path
+from typing import Optional
 import pandas as pd
 from pykrx import stock
 
+try:
+    import yfinance as yf
+    _HAS_YFINANCE = True
+except ImportError:
+    _HAS_YFINANCE = False
+
 import sys
-from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from config import MAX_RETRIES, RETRY_DELAY, MIN_RETURNS_3M, TOP_N_RETURNS, LOOKBACK_DAYS, DATA_DIR
+from config import (
+    MAX_RETRIES, RETRY_DELAY, DATA_DIR,
+    KRX_USER_ID, KRX_PASSWORD,
+    PRIORITY_MANAGERS, TOP_N_PER_MANAGER, TOP_N_OTHER,
+    EXCLUDE_KEYWORDS,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# 캐시 유틸리티 함수
+# KRX 로그인 (ETF API 인증 필수)
 # ============================================================
 
-def _get_cache_path(date: str, cache_type: str, suffix: str = None) -> Path:
-    """캐시 파일 경로 생성"""
+def setup_krx_session() -> bool:
+    """KRX 로그인 세션을 pykrx에 주입.
+
+    Returns:
+        True 로그인 성공, False 실패/자격증명 없음
+    """
+    import requests
+    from pykrx.website.comm import webio
+
+    _session = requests.Session()
+    _session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001.cmd'
+    })
+
+    def _session_post_read(self, **params):
+        return _session.post(self.url, headers=self.headers, data=params)
+
+    webio.Post.read = _session_post_read
+
+    if not KRX_USER_ID or not KRX_PASSWORD:
+        logger.warning("KRX 계정 정보 없음 (.env에 KRX_USER_ID/KRX_PASSWORD 설정 필요)")
+        return False
+
+    try:
+        _session.get("https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001.cmd")
+
+        login_url = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001D1.cmd"
+        login_data = {
+            "mbrNm": "", "telNo": "", "di": "", "certType": "",
+            "mbrId": KRX_USER_ID, "pw": KRX_PASSWORD,
+        }
+        response = _session.post(login_url, data=login_data)
+
+        if response.status_code != 200:
+            logger.error(f"KRX 로그인 실패 (HTTP {response.status_code})")
+            return False
+
+        result = response.json()
+        if result.get("_error_code") == "CD001":
+            logger.info("KRX 로그인 성공")
+            return True
+
+        # 중복 로그인 → skipDup 재시도
+        if result.get("_error_code") == "CD011":
+            login_data["skipDup"] = "Y"
+            response = _session.post(login_url, data=login_data)
+            result = response.json()
+            if result.get("_error_code") == "CD001":
+                logger.info("KRX 로그인 성공 (중복 로그인 해제)")
+                return True
+
+        logger.error(f"KRX 로그인 실패: {result.get('_error_message', 'Unknown')}")
+        return False
+
+    except Exception as e:
+        logger.error(f"KRX 로그인 중 오류: {e}")
+        return False
+
+
+# 모듈 로드 시 자동 로그인
+setup_krx_session()
+
+
+# ============================================================
+# 캐시 유틸
+# ============================================================
+
+def _cache_path(date: str, ticker: str) -> Path:
     DATA_DIR.mkdir(exist_ok=True)
-    if suffix:
-        return DATA_DIR / f"cache_{date}_{cache_type}_{suffix}.csv"
-    return DATA_DIR / f"cache_{date}_{cache_type}.csv"
+    return DATA_DIR / f"cache_{date}_holdings_{ticker}.csv"
 
 
-def _load_cache_csv(cache_path: Path) -> Optional[pd.DataFrame]:
-    """CSV 캐시 파일 로드"""
-    if cache_path.exists():
+def _load_cache(path: Path) -> Optional[pd.DataFrame]:
+    if path.exists():
         try:
-            df = pd.read_csv(cache_path, encoding='utf-8-sig')
-            logger.info(f"캐시 로드: {cache_path.name}")
+            df = pd.read_csv(path, encoding='utf-8-sig', dtype={'티커': str, 'ETF_Ticker': str})
+            logger.debug(f"캐시 로드: {path.name}")
             return df
         except Exception as e:
             logger.debug(f"캐시 로드 실패: {e}")
     return None
 
 
-def _save_cache_csv(df: pd.DataFrame, cache_path: Path):
-    """DataFrame을 CSV 캐시로 저장"""
+def _save_cache(df: pd.DataFrame, path: Path):
     try:
-        df.to_csv(cache_path, index=False, encoding='utf-8-sig')
-        logger.info(f"캐시 저장: {cache_path.name}")
+        df.to_csv(path, index=False, encoding='utf-8-sig')
+        logger.debug(f"캐시 저장: {path.name}")
     except Exception as e:
         logger.debug(f"캐시 저장 실패: {e}")
 
 
-def _load_cache_json(cache_path: Path) -> Optional[dict]:
-    """JSON 캐시 파일 로드"""
-    json_path = cache_path.with_suffix('.json')
-    if json_path.exists():
-        try:
-            with open(json_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            logger.info(f"캐시 로드: {json_path.name}")
-            return data
-        except Exception as e:
-            logger.debug(f"캐시 로드 실패: {e}")
-    return None
-
-
-def _save_cache_json(data: dict, cache_path: Path):
-    """dict를 JSON 캐시로 저장"""
-    json_path = cache_path.with_suffix('.json')
-    try:
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        logger.info(f"캐시 저장: {json_path.name}")
-    except Exception as e:
-        logger.debug(f"캐시 저장 실패: {e}")
-
-
-def _retry_api_call(func, *args, **kwargs):
-    """
-    [API 호출 재시도 로직]
-    네트워크 오류나 일시적 장애에 대비하여 최대 MAX_RETRIES회 재시도
-    """
+def _retry(func, *args, **kwargs):
+    """API 호출 재시도 (네트워크 일시 장애 대비)."""
+    last_exc = None
     for attempt in range(MAX_RETRIES):
         try:
-            result = func(*args, **kwargs)
-            return result
+            return func(*args, **kwargs)
         except Exception as e:
+            last_exc = e
             logger.warning(f"API 호출 실패 (시도 {attempt + 1}/{MAX_RETRIES}): {e}")
             if attempt < MAX_RETRIES - 1:
                 time.sleep(RETRY_DELAY)
-            else:
-                raise
+    raise last_exc
 
 
-def get_target_etfs(
-    min_returns: float = MIN_RETURNS_3M,
-    top_n: int = TOP_N_RETURNS,
-    date: str = None
-) -> List[str]:
-    """
-    분석 대상 액티브 ETF 티커 목록 추출
-    [3개월 수익률 기준 필터링 - 최적화 버전]
-    [캐싱 지원: 동일 날짜/설정의 결과 재사용]
+def _get_etf_mktcap(ticker: str, date: str) -> float:
+    """snapshot에서 해당 ETF의 시가총액(MKTCAP) 조회. 없으면 0."""
+    snap = _fetch_etf_full_snapshot(date)
+    if snap is None:
+        return 0
+    row = snap[snap['ISU_SRT_CD'].astype(str) == str(ticker)]
+    if row.empty:
+        return 0
+    return _parse_num(row['MKTCAP']).iloc[0]
 
-    Args:
-        min_returns: 최소 수익률 기준 (%)
-        top_n: 수익률 상위 N개만 선택 (0이면 제한 없음)
-        date: 조회 기준일 (YYYYMMDD). None이면 당일
 
-    Returns:
-        액티브 ETF 티커 리스트
-    """
-    if date is None:
-        date = datetime.now().strftime("%Y%m%d")
+# ============================================================
+# 해외종목 가격 조회 (yfinance)
+# ============================================================
 
-    # [캐시 확인]
-    cache_path = _get_cache_path(date, f"target_etfs_min{min_returns}_top{top_n}")
-    cached_data = _load_cache_json(cache_path)
-    if cached_data:
-        logger.info(f"캐시에서 타겟 ETF 로드: {len(cached_data['tickers'])}개")
-        # 캐시된 ETF 목록 출력
-        for e in cached_data['etf_returns'][:10]:
-            logger.info(f"  - {e['ticker']} {e['name']}: {e['returns_3m']:+.2f}%")
-        if len(cached_data['etf_returns']) > 10:
-            logger.info(f"  ... 외 {len(cached_data['etf_returns']) - 10}개")
-        return cached_data['tickers']
+_YF_TICKER_CACHE_PATH = DATA_DIR / "yf_ticker_cache.json"
+_TICKER_MAP_PATH = DATA_DIR / "ticker_map.json"
 
-    logger.info(f"ETF 티커 목록 조회 중... (기준일: {date})")
+_NAME_SUFFIXES = r'(-CL [A-Z]|-CLASS [A-Z]|-SP ADR|-ADR|-NY REG SHS|-SHS|-A$)'
+_US_EXCHANGES = {'NMS', 'NYQ', 'PCX', 'NGM', 'NCM', 'ASE'}
+_SKIP_KEYWORDS = ['설정현금', '원화현금', '외화현금', '선물', '예치금', '현금']
 
-    # [Step 1] 전체 ETF 티커 목록 획득
-    all_tickers = _retry_api_call(stock.get_etf_ticker_list, date)
-    logger.info(f"전체 ETF 수: {len(all_tickers)}")
 
-    # [Step 2] '액티브' 이름 필터링
-    active_tickers = {}
-    for ticker in all_tickers:
+def _load_json(path: Path) -> dict:
+    if path.exists():
         try:
-            name = stock.get_etf_ticker_name(ticker)
-            if "액티브" in name:
-                active_tickers[ticker] = name
+            return json.loads(path.read_text(encoding='utf-8'))
         except Exception:
-            continue
+            pass
+    return {}
 
-    logger.info(f"액티브 ETF 수: {len(active_tickers)}")
 
-    # [Step 3] 한 번에 모든 ETF의 N일 수익률 조회 (최적화)]
-    end_dt = datetime.strptime(date, "%Y%m%d")
-    start_dt = end_dt - timedelta(days=LOOKBACK_DAYS)
-    start_date = start_dt.strftime("%Y%m%d")
+def _save_json(data: dict, path: Path):
+    try:
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+    except Exception as e:
+        logger.debug(f"JSON 저장 실패 ({path.name}): {e}")
 
-    logger.info(f"수익률 조회 중... ({start_date} ~ {date})")
+
+def _resolve_yahoo_tickers(names: list[str]) -> dict[str, str]:
+    """KRX 해외종목명 → Yahoo Finance 티커 매핑.
+
+    우선순위: 수동 매핑 → 캐시 → yfinance Search (접미사 정리 + US 거래소 필터)
+    """
+    manual_map = _load_json(_TICKER_MAP_PATH)
+    cache = _load_json(_YF_TICKER_CACHE_PATH)
+    resolved = {}
+    to_search = []
+
+    for name in names:
+        if name in manual_map:
+            resolved[name] = manual_map[name]
+        elif name in cache:
+            resolved[name] = cache[name]
+        else:
+            to_search.append(name)
+
+    if not to_search:
+        return resolved
+
+    logger.info(f"yfinance 티커 검색: {len(to_search)}개 종목")
+    new_found = 0
+    for name in to_search:
+        cleaned = re.sub(_NAME_SUFFIXES, '', name).strip()
+        try:
+            s = yf.Search(cleaned)
+            symbol = None
+            for q in (s.quotes or []):
+                if q.get('exchange') in _US_EXCHANGES:
+                    symbol = q['symbol']
+                    break
+            if not symbol and s.quotes:
+                symbol = s.quotes[0]['symbol']
+            if symbol:
+                resolved[name] = symbol
+                cache[name] = symbol
+                new_found += 1
+        except Exception as e:
+            logger.debug(f"yfinance 검색 실패 ({name}): {e}")
+
+    if new_found:
+        _save_json(cache, _YF_TICKER_CACHE_PATH)
+        logger.info(f"yfinance 티커 매핑 완료: {new_found}개 신규")
+
+    return resolved
+
+
+def _fetch_foreign_prices_krw(
+    name_to_symbol: dict[str, str], date: str
+) -> dict[str, float]:
+    """Yahoo 티커별 종가(KRW 환산)를 배치 조회."""
+    if not name_to_symbol:
+        return {}
+
+    symbols = list(set(name_to_symbol.values()))
+    all_symbols = symbols + ['USDKRW=X']
+
+    # 해당 날짜 전후 7일 범위로 조회
+    d = pd.Timestamp(f"{date[:4]}-{date[4:6]}-{date[6:8]}")
+    start = (d - timedelta(days=7)).strftime('%Y-%m-%d')
+    end = (d + timedelta(days=1)).strftime('%Y-%m-%d')
 
     try:
-        # [get_etf_price_change_by_ticker로 전체 ETF 수익률 한 번에 조회]
-        price_change_df = _retry_api_call(
-            stock.get_etf_price_change_by_ticker, start_date, date
+        data = yf.download(all_symbols, start=start, end=end, progress=False)
+        if data.empty:
+            logger.warning("yfinance 가격 조회: 빈 데이터")
+            return {}
+
+        close = data['Close']
+        if isinstance(close, pd.Series):
+            close = close.to_frame(all_symbols[0])
+
+        # 환율
+        fx_rate = 1400.0
+        if 'USDKRW=X' in close.columns:
+            fx_col = close['USDKRW=X'].dropna()
+            if not fx_col.empty:
+                fx_rate = float(fx_col.iloc[-1])
+
+        # 종목별 최신 종가 × 환율
+        prices_krw = {}
+        for name, symbol in name_to_symbol.items():
+            if symbol in close.columns:
+                price_col = close[symbol].dropna()
+                if not price_col.empty:
+                    prices_krw[name] = float(price_col.iloc[-1] * fx_rate)
+
+        logger.info(
+            f"해외종목 가격 조회: {len(prices_krw)}/{len(name_to_symbol)}개 성공 "
+            f"(USD/KRW={fx_rate:.0f})"
         )
-        logger.info(f"수익률 데이터 조회 완료: {len(price_change_df)}개 ETF")
+        return prices_krw
+
     except Exception as e:
-        logger.error(f"수익률 데이터 조회 실패: {e}")
-        return []
-
-    # [Step 4] 액티브 ETF만 필터링하고 수익률 정렬
-    etf_returns = []
-    for ticker, name in active_tickers.items():
-        if ticker in price_change_df.index:
-            returns = price_change_df.loc[ticker, '등락률']
-            etf_returns.append({
-                'ticker': ticker,
-                'name': name,
-                'returns_3m': round(returns, 2)
-            })
-
-    # [수익률 기준 정렬 (내림차순)]
-    etf_returns.sort(key=lambda x: x['returns_3m'], reverse=True)
-
-    # [최소 수익률 필터링]
-    if min_returns > 0:
-        etf_returns = [e for e in etf_returns if e['returns_3m'] >= min_returns]
-        logger.info(f"수익률 >= {min_returns}% 필터 후: {len(etf_returns)}개")
-
-    # [상위 N개 선택]
-    if top_n > 0 and len(etf_returns) > top_n:
-        etf_returns = etf_returns[:top_n]
-        logger.info(f"상위 {top_n}개 선택")
-
-    target_tickers = [e['ticker'] for e in etf_returns]
-
-    logger.info(f"분석 대상 액티브 ETF 수: {len(target_tickers)}")
-
-    # [선택된 ETF 목록 출력]
-    for e in etf_returns[:10]:
-        logger.info(f"  - {e['ticker']} {e['name']}: {e['returns_3m']:+.2f}%")
-    if len(etf_returns) > 10:
-        logger.info(f"  ... 외 {len(etf_returns) - 10}개")
-
-    # [캐시 저장]
-    _save_cache_json({
-        'tickers': target_tickers,
-        'etf_returns': etf_returns,
-        'min_returns': min_returns,
-        'top_n': top_n
-    }, cache_path)
-
-    return target_tickers
+        logger.error(f"yfinance 가격 조회 실패: {e}")
+        return {}
 
 
-def get_etf_holdings(ticker: str, date: str = None) -> Optional[pd.DataFrame]:
-    """
-    개별 ETF의 구성 종목 및 비중 조회
-    [캐싱 지원: 동일 날짜/티커의 구성종목 재사용]
+def _enrich_foreign_holdings(
+    df: pd.DataFrame, etf_ticker: str, date: str
+) -> pd.DataFrame:
+    """해외종목의 금액·비중을 yfinance 가격으로 보강한다."""
+    amounts = pd.to_numeric(df['금액'], errors='coerce').fillna(0)
+    shares = pd.to_numeric(df['계약수'], errors='coerce').fillna(0)
+
+    # 해외종목 판별: 금액=0, 계약수>0, 비주식 아님
+    foreign_names = []
+    foreign_idx = []
+    for idx in df.index:
+        if amounts.loc[idx] == 0 and shares.loc[idx] > 0:
+            name = str(df.loc[idx, '구성종목명'])
+            if not any(kw in name for kw in _SKIP_KEYWORDS):
+                foreign_names.append(name)
+                foreign_idx.append(idx)
+
+    if not foreign_names:
+        return df
+
+    # 1. 티커 매핑
+    name_to_symbol = _resolve_yahoo_tickers(list(set(foreign_names)))
+    if not name_to_symbol:
+        logger.info(f"{etf_ticker}: 해외종목 {len(foreign_names)}개 티커 매핑 실패")
+        return df
+
+    # 2. 가격 조회 (KRW)
+    prices_krw = _fetch_foreign_prices_krw(name_to_symbol, date)
+    if not prices_krw:
+        return df
+
+    # 3. 금액 채우기
+    df = df.copy()
+    filled = 0
+    for idx in foreign_idx:
+        name = str(df.loc[idx, '구성종목명'])
+        if name in prices_krw:
+            qty = float(shares.loc[idx])
+            df.loc[idx, '금액'] = int(qty * prices_krw[name])
+            filled += 1
+
+    # 4. 전체 비중 재계산 (sum(금액) 분모 — PDF는 CU 단위이므로 MKTCAP이 아님)
+    new_amounts = pd.to_numeric(df['금액'], errors='coerce').fillna(0)
+    total = new_amounts.sum()
+    if total > 0:
+        df['비중'] = (new_amounts / total * 100).round(4)
+        logger.info(
+            f"{etf_ticker}: 해외종목 {filled}/{len(foreign_names)}개 금액 보강, "
+            f"비중 재계산 완료"
+        )
+
+    return df
+
+
+# ============================================================
+# ETF 구성종목 조회
+# ============================================================
+
+def get_etf_holdings(ticker: str, date: str) -> Optional[pd.DataFrame]:
+    """개별 ETF의 구성종목을 조회하고 비중을 재계산한다.
+
+    pykrx의 get_etf_portfolio_deposit_file은 '비중' 컬럼을 0으로 반환하는 경우가 많아,
+    '금액' 컬럼을 ETF 총액으로 나눠 비중(%)을 재계산한다.
 
     Args:
         ticker: ETF 티커
-        date: 조회 기준일 (YYYYMMDD)
+        date: YYYYMMDD
 
     Returns:
-        구성 종목 DataFrame (종목코드, 종목명, 비중 등)
+        컬럼: [티커, 구성종목명, 계약수, 금액, 시가총액, 비중, ETF_Ticker, ETF_Name]
+        실패 시 None.
     """
-    if date is None:
-        date = datetime.now().strftime("%Y%m%d")
-
-    # [캐시 확인]
-    cache_path = _get_cache_path(date, "holdings", ticker)
-    cached_df = _load_cache_csv(cache_path)
-    if cached_df is not None and not cached_df.empty:
-        return cached_df
+    cache = _cache_path(date, ticker)
+    cached = _load_cache(cache)
+    if cached is not None and not cached.empty:
+        return cached
 
     try:
-        # [PDF(구성종목) 데이터 조회]
-        df = _retry_api_call(stock.get_etf_portfolio_deposit_file, ticker, date)
-
+        df = _retry(stock.get_etf_portfolio_deposit_file, ticker, date)
         if df is None or df.empty:
-            logger.warning(f"{ticker}: 구성종목 데이터 없음")
+            logger.warning(f"{ticker}@{date}: 구성종목 데이터 없음")
             return None
 
-        # [ETF 티커 정보 추가]
-        df['ETF_Ticker'] = ticker
-        df['ETF_Name'] = stock.get_etf_ticker_name(ticker)
-
-        # [인덱스(티커)를 컬럼으로 변환]
+        # 인덱스(종목 티커)를 컬럼으로
         df = df.reset_index()
         if 'index' in df.columns:
-            df = df.rename(columns={'index': '종목코드'})
+            df = df.rename(columns={'index': '티커'})
+        df['티커'] = df['티커'].astype(str)
 
-        # [캐시 저장]
-        _save_cache_csv(df, cache_path)
+        # 해외종목 금액 보강 (yfinance)
+        if _HAS_YFINANCE and '금액' in df.columns and '구성종목명' in df.columns:
+            df = _enrich_foreign_holdings(df, ticker, date)
 
+        # 비중 재계산: pykrx의 '비중' 컬럼이 0으로만 차있으면 금액으로 역산
+        # (PDF는 CU 단위 — sum(금액)이 분모)
+        if '비중' in df.columns and '금액' in df.columns:
+            weight_sum = pd.to_numeric(df['비중'], errors='coerce').fillna(0).sum()
+            if weight_sum <= 0:
+                amounts = pd.to_numeric(df['금액'], errors='coerce').fillna(0)
+                total = amounts.sum()
+                if total > 0:
+                    df['비중'] = (amounts / total * 100).round(4)
+                    logger.debug(f"{ticker}: 비중 재계산 (분모=sum(금액))")
+
+        # ETF 식별 컬럼 추가
+        df['ETF_Ticker'] = ticker
+        try:
+            df['ETF_Name'] = stock.get_etf_ticker_name(ticker)
+        except Exception:
+            df['ETF_Name'] = ticker
+
+        _save_cache(df, cache)
         return df
 
     except Exception as e:
-        logger.error(f"{ticker} 구성종목 조회 실패: {e}")
+        logger.error(f"{ticker}@{date} 구성종목 조회 실패: {e}")
         return None
 
 
-def get_etf_info(tickers: List[str], date: str = None) -> pd.DataFrame:
+def get_etf_name(ticker: str) -> str:
+    """ETF 이름 조회 (실패 시 티커 그대로 반환)."""
+    try:
+        return stock.get_etf_ticker_name(ticker)
+    except Exception:
+        return ticker
+
+
+# ============================================================
+# ETF 전종목 시세 / 동적 선정
+# ============================================================
+
+def _fetch_etf_full_snapshot(date: str) -> Optional[pd.DataFrame]:
+    """전종목 시세 + 순자산 + 상장좌수 포함 snapshot.
+
+    pykrx의 공개 wrapper에는 MKTCAP/LIST_SHRS가 노출되지 않아, 내부 KRX 클래스를 직접 호출.
+    캐시: data/cache_{date}_etf_snapshot.csv
     """
-    ETF 기본 정보 조회 (수익률, 거래량 등)
-    [캐싱 지원: 동일 날짜/티커 목록의 ETF 정보 재사용]
-
-    Args:
-        tickers: ETF 티커 리스트
-        date: 조회 기준일
-
-    Returns:
-        ETF 정보 DataFrame
-    """
-    if date is None:
-        date = datetime.now().strftime("%Y%m%d")
-
-    # [캐시 확인 - 티커 목록의 해시를 사용]
-    tickers_hash = hash(tuple(sorted(tickers))) % 100000
-    cache_path = _get_cache_path(date, f"etf_info_{tickers_hash}")
-    cached_df = _load_cache_csv(cache_path)
-    if cached_df is not None and not cached_df.empty:
-        # 캐시된 티커가 요청된 티커와 일치하는지 확인
-        cached_tickers = set(cached_df['Ticker'].tolist())
-        if set(tickers) == cached_tickers:
-            return cached_df
-
-    # [수익률 데이터 미리 조회]
-    end_dt = datetime.strptime(date, "%Y%m%d")
-    start_dt = end_dt - timedelta(days=LOOKBACK_DAYS)
-    start_date = start_dt.strftime("%Y%m%d")
+    cache = DATA_DIR / f"cache_{date}_etf_snapshot.csv"
+    if cache.exists():
+        try:
+            return pd.read_csv(cache, encoding='utf-8-sig', dtype={'ISU_SRT_CD': str})
+        except Exception:
+            pass
 
     try:
-        price_change_df = _retry_api_call(
-            stock.get_etf_price_change_by_ticker, start_date, date
-        )
-    except Exception:
-        price_change_df = pd.DataFrame()
+        from pykrx.website.krx.etx.core import 전종목시세_ETF
+        df = _retry(전종목시세_ETF().fetch, date)
+        if df is None or df.empty:
+            return None
+        _save_cache(df, cache)
+        return df
+    except Exception as e:
+        logger.error(f"ETF 전종목 시세 조회 실패 ({date}): {e}")
+        return None
 
-    etf_data = []
 
-    for ticker in tickers:
-        try:
-            name = stock.get_etf_ticker_name(ticker)
-            ohlcv = _retry_api_call(stock.get_etf_ohlcv_by_date, date, date, ticker)
+def _parse_num(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series.astype(str).str.replace(',', '', regex=False), errors='coerce').fillna(0)
 
-            if ohlcv.empty:
-                continue
 
-            row = ohlcv.iloc[-1]
+def select_target_etfs(date: str) -> list[dict]:
+    """대상 ETF 선정: 우선 운용사 각 N개 + 나머지 전체 AUM 상위 N개.
 
-            # [당일 등락률 계산: (종가 - 시가) / 시가 * 100]
-            change_pct = ((row['종가'] - row['시가']) / row['시가'] * 100) if row['시가'] > 0 else 0
+    PRIORITY_MANAGERS(TIME, KoAct) 각각 AUM 상위 TOP_N_PER_MANAGER개를 먼저 확보한 뒤,
+    나머지 전체 equity 액티브 ETF 중 중복 없이 AUM 상위 TOP_N_OTHER개를 추가.
 
-            # [3개월 수익률]
-            returns_3m = 0
-            if ticker in price_change_df.index:
-                returns_3m = round(price_change_df.loc[ticker, '등락률'], 2)
+    Returns:
+        [{'ticker': str, 'name': str, 'mktcap': float, 'trading_value': float,
+          'group': 'TIME' | 'KoAct' | 'Other'}, ...]
+    """
+    df = _fetch_etf_full_snapshot(date)
+    if df is None or df.empty:
+        logger.warning(f"{date}: 전종목 snapshot 없음 — 대상 ETF 선정 실패")
+        return []
 
-            etf_data.append({
-                'Ticker': ticker,
-                'Name': name,
-                'Close': row['종가'],
-                'NAV': row.get('NAV', row['종가']),
-                'Volume': row['거래량'],
-                'TradingValue': row.get('거래대금', 0),
-                'Change_Pct': round(change_pct, 2),
-                'Returns_3M': returns_3m
+    # '액티브' 포함 + 채권/금리/MM 제외
+    active = df[df['ISU_ABBRV'].str.contains('액티브', na=False)].copy()
+    if EXCLUDE_KEYWORDS:
+        exclude_pattern = '|'.join(EXCLUDE_KEYWORDS)
+        active = active[~active['ISU_ABBRV'].str.contains(exclude_pattern, na=False)]
+
+    active['MKTCAP_NUM'] = _parse_num(active['MKTCAP'])
+    active['TRDVAL_NUM'] = _parse_num(active['ACC_TRDVAL'])
+    active = active[active['MKTCAP_NUM'] > 0]
+
+    # [Step 1] 우선 운용사별 AUM 상위 N개
+    picked_tickers = set()
+    result = []
+
+    for mgr in PRIORITY_MANAGERS:
+        mgr_df = active[active['ISU_ABBRV'].str.startswith(mgr)]
+        top = mgr_df.nlargest(TOP_N_PER_MANAGER, 'MKTCAP_NUM')
+        for _, r in top.iterrows():
+            t = str(r['ISU_SRT_CD'])
+            picked_tickers.add(t)
+            result.append({
+                'ticker': t,
+                'name': str(r['ISU_ABBRV']),
+                'mktcap': float(r['MKTCAP_NUM']),
+                'trading_value': float(r['TRDVAL_NUM']),
+                'group': mgr,
             })
+        logger.info(f"  {mgr}: AUM 상위 {len(top)}개 선정")
 
-        except Exception as e:
-            logger.debug(f"{ticker} 정보 조회 실패: {e}")
-            continue
+    # [Step 2] 나머지 전체에서 AUM 상위 N개 (중복 제외)
+    remaining = active[~active['ISU_SRT_CD'].astype(str).isin(picked_tickers)]
+    top_other = remaining.nlargest(TOP_N_OTHER, 'MKTCAP_NUM')
+    for _, r in top_other.iterrows():
+        result.append({
+            'ticker': str(r['ISU_SRT_CD']),
+            'name': str(r['ISU_ABBRV']),
+            'mktcap': float(r['MKTCAP_NUM']),
+            'trading_value': float(r['TRDVAL_NUM']),
+            'group': 'Other',
+        })
 
-    result_df = pd.DataFrame(etf_data)
+    mgr_counts = [f"{m} {sum(1 for r in result if r['group']==m)}" for m in PRIORITY_MANAGERS]
+    other_count = sum(1 for r in result if r['group'] == 'Other')
+    logger.info(f"대상 ETF 선정: {len(result)}개 ({', '.join(mgr_counts)}, Other {other_count})")
+    return result
 
-    # [캐시 저장]
-    if not result_df.empty:
-        _save_cache_csv(result_df, cache_path)
 
-    return result_df
+# ============================================================
+# 신규 상장 액티브 ETF 감지
+# ============================================================
+
+def find_newly_listed_active_etfs(today_date: str, prev_date: str) -> list[dict]:
+    """prev_date에는 없고 today_date에 존재하는 '액티브' ETF 탐지.
+
+    Returns:
+        [{'ticker': str, 'name': str}, ...]
+    """
+    today_df = _fetch_etf_full_snapshot(today_date)
+    prev_df = _fetch_etf_full_snapshot(prev_date)
+    if today_df is None or prev_df is None:
+        return []
+
+    prev_tickers = set(prev_df['ISU_SRT_CD'].astype(str))
+    today_active = today_df[today_df['ISU_ABBRV'].str.contains('액티브', na=False)].copy()
+
+    newly = today_active[~today_active['ISU_SRT_CD'].astype(str).isin(prev_tickers)]
+    if newly.empty:
+        return []
+
+    return [
+        {'ticker': str(r['ISU_SRT_CD']), 'name': str(r['ISU_ABBRV'])}
+        for _, r in newly.iterrows()
+    ]

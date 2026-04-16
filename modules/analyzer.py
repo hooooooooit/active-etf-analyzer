@@ -1,261 +1,204 @@
 """
-액티브 ETF 구성 종목 분석 모듈
+ETF별 구성종목 변동 분석 모듈
+
+- 한 ETF의 두 날짜(D-1 vs D-2) 구성종목을 비교
+- **계약수(주수) 변화**를 기준으로 실제 운용 의사결정만 추출
+  (주가 등락에 의한 패시브 비중 변화는 무시)
+- 여러 ETF에 공통으로 나타나는 신호(3개 이상 ETF에서 동시 매수/신규 편입) 추출
 """
 import logging
-from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Dict, List, Optional
 import pandas as pd
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from config import DATA_DIR, TOP_N
+from config import COMMON_SIGNAL_MIN_ETFS
 
 logger = logging.getLogger(__name__)
 
 
-def load_previous_data(date: str = None) -> Optional[pd.DataFrame]:
-    """
-    전일(T-1) 분석 데이터 로드
+# ============================================================
+# 단일 ETF diff (계약수 기반)
+# ============================================================
 
-    Args:
-        date: 기준일 (YYYYMMDD). None이면 당일 기준 전일 데이터 로드
-
-    Returns:
-        전일 분석 데이터 DataFrame 또는 None
-    """
-    if date is None:
-        date = datetime.now().strftime("%Y%m%d")
-
-    # [전일 날짜 계산 - 영업일 고려 필요시 수정]
-    current_date = datetime.strptime(date, "%Y%m%d")
-    prev_date = current_date - timedelta(days=1)
-
-    # [주말 건너뛰기]
-    while prev_date.weekday() >= 5:  # 토요일(5), 일요일(6)
-        prev_date -= timedelta(days=1)
-
-    prev_date_str = prev_date.strftime("%Y%m%d")
-    prev_file = DATA_DIR / f"{prev_date_str}.csv"
-
-    if prev_file.exists():
-        logger.info(f"전일 데이터 로드: {prev_file}")
-        return pd.read_csv(prev_file, encoding='utf-8-sig')
-    else:
-        logger.info(f"전일 데이터 없음: {prev_file}")
-        return None
-
-
-def analyze_holdings(
-    holdings_list: List[pd.DataFrame],
-    prev_df: Optional[pd.DataFrame] = None
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    전체 액티브 ETF의 구성 종목 비중 분석
-
-    Args:
-        holdings_list: 각 ETF의 구성종목 DataFrame 리스트
-        prev_df: 전일 분석 데이터
-
-    Returns:
-        (합산 비중 분석 결과, 비중 변동 분석 결과) 튜플
-    """
-    if not holdings_list:
-        logger.warning("분석할 구성종목 데이터가 없습니다")
-        return pd.DataFrame(), pd.DataFrame()
-
-    # [Step 1] 모든 ETF 구성종목 통합
-    combined_df = pd.concat(holdings_list, ignore_index=True)
-    logger.info(f"통합 데이터: {len(combined_df)} 행")
-
-    # [Step 2] 종목명 기준 합산 비중 계산]
-    # pykrx PDF 데이터 컬럼 확인 후 비중 컬럼명 조정 필요
-    weight_col = None
-    for col in ['비중', '비중(%)', 'Weight', '구성비중']:
-        if col in combined_df.columns:
-            weight_col = col
-            break
-
-    if weight_col is None:
-        logger.warning(f"비중 컬럼을 찾을 수 없음. 컬럼: {combined_df.columns.tolist()}")
-        # [비중 컬럼이 없는 경우 금액 기반으로 비중 계산 시도]
-        if '평가금액' in combined_df.columns:
-            total_value = combined_df['평가금액'].sum()
-            combined_df['비중'] = (combined_df['평가금액'] / total_value * 100).round(4)
-            weight_col = '비중'
-        else:
-            return pd.DataFrame(), pd.DataFrame()
-
-    # [종목명 컬럼 확인]
-    name_col = None
-    for col in ['종목명', '종목', 'Name', '구성종목명']:
-        if col in combined_df.columns:
-            name_col = col
-            break
-
-    if name_col is None:
-        logger.warning(f"종목명 컬럼을 찾을 수 없음. 컬럼: {combined_df.columns.tolist()}")
-        return pd.DataFrame(), pd.DataFrame()
-
-    # [Step 3] 종목별 평균 비중 계산 (전체 액티브 ETF 내)]
-    # 비중 합계: 해당 종목이 여러 ETF에 편입된 경우 합산
-    # 평균 비중: 편입된 ETF 수로 나눈 평균
-    consensus_df = combined_df.groupby(name_col).agg({
-        weight_col: ['sum', 'mean', 'count']
-    }).reset_index()
-
-    consensus_df.columns = ['StockName', 'TotalWeight', 'AvgWeight', 'ETF_Count']
-
-    # [합산 비중 기준 정렬]
-    consensus_df = consensus_df.sort_values('TotalWeight', ascending=False)
-    consensus_df['Rank'] = range(1, len(consensus_df) + 1)
-
-    logger.info(f"종목 수: {len(consensus_df)}")
-
-    # [Step 4] 전일 대비 변동 분석
-    if prev_df is not None and not prev_df.empty:
-        diff_df = _calculate_diff(consensus_df, prev_df)
-    else:
-        # [전일 데이터 없는 경우 모든 종목을 신규로 표시]
-        diff_df = consensus_df.copy()
-        diff_df['Weight_Diff'] = 0.0
-        diff_df['Status'] = 'New'
-        diff_df['Prev_Weight'] = 0.0
-
-    return consensus_df, diff_df
-
-
-def _calculate_diff(
-    today_df: pd.DataFrame,
-    prev_df: pd.DataFrame
+def diff_etf(
+    today: Optional[pd.DataFrame],
+    prev: Optional[pd.DataFrame],
 ) -> pd.DataFrame:
+    """단일 ETF의 D-1 vs D-2 구성종목 비교 (계약수 변화 기준).
+
+    Returns:
+        컬럼: [StockName, Shares_Today, Shares_Prev, Shares_Diff,
+               Weight_Today, Weight_Prev, Weight_Diff, Status]
+        Status: 'New' | 'Out' | 'Buy' | 'Sell' | 'Hold'
+        - New/Out: 종목 편입/편출
+        - Buy/Sell: 계약수 증가/감소 (실제 매매)
+        - Hold: 계약수 변화 없음 (비중 변화는 주가에 의한 것)
     """
-    [비중 변동 계산 로직]
+    cols = ['StockName', 'Shares_Today', 'Shares_Prev', 'Shares_Diff',
+            'Weight_Today', 'Weight_Prev', 'Weight_Diff', 'Status']
+    if today is None or today.empty or prev is None or prev.empty:
+        return pd.DataFrame(columns=cols)
 
-    전일 대비 비중 변화(Δ) 및 편입/제외 상태 분류:
-    - New: 오늘 신규 편입된 종목
-    - Out: 오늘 제외된 종목 (전일에는 있었으나 오늘은 없음)
-    - Maintain: 유지 중인 종목
-    """
-    # [Outer Join으로 모든 종목 포함]
-    merged = pd.merge(
-        today_df[['StockName', 'TotalWeight']],
-        prev_df[['StockName', 'TotalWeight']],
-        on='StockName',
-        how='outer',
-        suffixes=('_Today', '_Prev')
-    )
+    # 구성종목명 + 계약수 + 비중 추출
+    def _prep(df, suffix):
+        out = df[['구성종목명', '계약수', '비중']].copy()
+        out.columns = ['StockName', f'Shares_{suffix}', f'Weight_{suffix}']
+        out[f'Shares_{suffix}'] = pd.to_numeric(out[f'Shares_{suffix}'], errors='coerce').fillna(0)
+        out[f'Weight_{suffix}'] = pd.to_numeric(out[f'Weight_{suffix}'], errors='coerce').fillna(0)
+        return out
 
-    # [결측값 0으로 채우기]
-    merged['TotalWeight_Today'] = merged['TotalWeight_Today'].fillna(0)
-    merged['TotalWeight_Prev'] = merged['TotalWeight_Prev'].fillna(0)
+    t = _prep(today, 'Today')
+    p = _prep(prev, 'Prev')
 
-    # [비중 변화 계산]
-    merged['Weight_Diff'] = (
-        merged['TotalWeight_Today'] - merged['TotalWeight_Prev']
-    ).round(4)
+    merged = pd.merge(t, p, on='StockName', how='outer')
+    for c in ['Shares_Today', 'Shares_Prev', 'Weight_Today', 'Weight_Prev']:
+        merged[c] = merged[c].fillna(0)
+    merged['Shares_Diff'] = merged['Shares_Today'] - merged['Shares_Prev']
+    merged['Weight_Diff'] = (merged['Weight_Today'] - merged['Weight_Prev']).round(4)
 
-    # [상태 분류]
-    def classify_status(row):
-        if row['TotalWeight_Prev'] == 0 and row['TotalWeight_Today'] > 0:
+    # 계약수 diff 최소 임계값 (외국주 ETF는 소수점 계약수 → 0.01 수준 오차 발생)
+    _SHARES_NOISE = 0.5
+
+    def _status(row):
+        if row['Shares_Prev'] == 0 and row['Shares_Today'] > 0:
             return 'New'
-        elif row['TotalWeight_Today'] == 0 and row['TotalWeight_Prev'] > 0:
+        if row['Shares_Today'] == 0 and row['Shares_Prev'] > 0:
             return 'Out'
+        if row['Shares_Diff'] >= _SHARES_NOISE:
+            return 'Buy'
+        if row['Shares_Diff'] <= -_SHARES_NOISE:
+            return 'Sell'
+        return 'Hold'
+
+    merged['Status'] = merged.apply(_status, axis=1)
+    return merged[cols].sort_values('Shares_Diff', ascending=False).reset_index(drop=True)
+
+
+# ============================================================
+# 운용사 추출
+# ============================================================
+
+_MANAGER_PREFIXES = [
+    'KoAct', 'TIME', 'TIGER', 'KODEX', 'KBSTAR', 'RISE',
+    'ACE', 'PLUS', 'SOL', 'HANARO', 'ARIRANG', 'KINDEX',
+    'UNICORN', '1Q',
+]
+
+
+def extract_manager(etf_name: str) -> str:
+    """ETF 이름에서 운용사 prefix 추출. 매칭 실패 시 'Other'."""
+    if not etf_name:
+        return 'Other'
+    for prefix in _MANAGER_PREFIXES:
+        if etf_name.startswith(prefix):
+            return prefix
+    return 'Other'
+
+
+# ============================================================
+# 전체 ETF 분석
+# ============================================================
+
+def analyze_all_etfs(
+    holdings_today: Dict[str, pd.DataFrame],
+    holdings_prev: Dict[str, pd.DataFrame],
+    etf_names: Dict[str, str],
+) -> List[Dict]:
+    """각 ETF의 D-1 vs D-2 diff (계약수 기준).
+
+    Returns:
+        [{ticker, name, manager, new, out, buy, sell, has_changes}, ...]
+        new/out/buy/sell은 각각 DataFrame
+    """
+    results: List[Dict] = []
+
+    for ticker, today_df in holdings_today.items():
+        prev_df = holdings_prev.get(ticker)
+        name = etf_names.get(ticker, ticker)
+
+        diff = diff_etf(today_df, prev_df)
+        if diff.empty:
+            logger.info(f"{ticker} {name}: 비교 데이터 부족 (스킵)")
+            continue
+
+        new = diff[diff['Status'] == 'New']
+        out = diff[diff['Status'] == 'Out']
+        buy = diff[diff['Status'] == 'Buy']
+        sell = diff[diff['Status'] == 'Sell']
+
+        has_changes = bool(len(new) or len(out) or len(buy) or len(sell))
+
+        # 비중 상위 3개 (현재 포트폴리오 구성 요약). 비중 없으면 계약수 기준.
+        has_weight = diff[diff['Weight_Today'] >= 1.0]
+        if not has_weight.empty:
+            top3 = has_weight.nlargest(3, 'Weight_Today')
         else:
-            return 'Maintain'
+            top3 = diff[diff['Shares_Today'] > 0].nlargest(3, 'Shares_Today')
 
-    merged['Status'] = merged.apply(classify_status, axis=1)
+        # 현금 비중 (현금/예치금 관련 행)
+        _CASH_KW = ['현금', '예치', '설정현금']
+        cash_mask = diff['StockName'].str.contains('|'.join(_CASH_KW), na=False)
+        cash_today = float(diff.loc[cash_mask, 'Weight_Today'].sum())
+        cash_prev = float(diff.loc[cash_mask, 'Weight_Prev'].sum())
 
-    # [컬럼명 정리]
-    result = merged.rename(columns={
-        'TotalWeight_Today': 'TotalWeight',
-        'TotalWeight_Prev': 'Prev_Weight'
-    })
+        results.append({
+            'ticker': ticker,
+            'name': name,
+            'manager': extract_manager(name),
+            'new': new.reset_index(drop=True),
+            'out': out.reset_index(drop=True),
+            'buy': buy.reset_index(drop=True),
+            'sell': sell.reset_index(drop=True),
+            'top_holdings': top3.reset_index(drop=True),
+            'has_changes': has_changes,
+            'cash_today': cash_today,
+            'cash_prev': cash_prev,
+        })
 
-    # [비중 변화 크기 기준 정렬]
-    result = result.sort_values('Weight_Diff', ascending=False)
-
-    return result
-
-
-def save_daily_data(consensus_df: pd.DataFrame, date: str = None) -> Path:
-    """
-    당일 분석 결과 저장 (다음 날 비교용)
-
-    Args:
-        consensus_df: 합산 비중 분석 결과
-        date: 저장 기준일
-
-    Returns:
-        저장된 파일 경로
-    """
-    if date is None:
-        date = datetime.now().strftime("%Y%m%d")
-
-    DATA_DIR.mkdir(exist_ok=True)
-    file_path = DATA_DIR / f"{date}.csv"
-
-    consensus_df.to_csv(file_path, index=False, encoding='utf-8-sig')
-    logger.info(f"데이터 저장 완료: {file_path}")
-
-    return file_path
+    return results
 
 
-def get_top_holdings(consensus_df: pd.DataFrame, n: int = TOP_N) -> pd.DataFrame:
-    """상위 N개 종목 추출"""
-    return consensus_df.head(n).copy()
+# ============================================================
+# 공통 시그널
+# ============================================================
 
-
-def get_top_changes(diff_df: pd.DataFrame, n: int = TOP_N) -> pd.DataFrame:
-    """비중 증가 상위 N개 종목 추출"""
-    # [신규 편입 또는 비중 증가 종목만]
-    increases = diff_df[diff_df['Weight_Diff'] > 0].head(n)
-    return increases.copy()
-
-
-def get_new_entries(diff_df: pd.DataFrame) -> pd.DataFrame:
-    """신규 편입 종목"""
-    return diff_df[diff_df['Status'] == 'New'].copy()
-
-
-def get_exits(diff_df: pd.DataFrame) -> pd.DataFrame:
-    """제외 종목"""
-    return diff_df[diff_df['Status'] == 'Out'].copy()
-
-
-def get_top_weight_increases(diff_df: pd.DataFrame, n: int = TOP_N) -> pd.DataFrame:
-    """
-    비중이 급격히 증가한 종목 추출 (신규 편입 제외, 기존 보유 종목 중)
-
-    Args:
-        diff_df: 비중 변동 분석 결과
-        n: 상위 N개
+def find_common_signals(
+    etf_diffs: List[Dict],
+    min_etfs: int = COMMON_SIGNAL_MIN_ETFS,
+) -> pd.DataFrame:
+    """여러 ETF에서 동시에 New 또는 Buy 상태인 종목을 카운트 기반으로 집계.
 
     Returns:
-        비중 증가 상위 종목 DataFrame
+        컬럼: [StockName, ETF_Count, Avg_Shares_Diff, New_Count]
+        해당 없음 시 빈 DataFrame.
     """
-    # 기존 보유 종목 중 비중이 증가한 종목만 (신규 편입 제외)
-    increases = diff_df[
-        (diff_df['Status'] == 'Maintain') &
-        (diff_df['Weight_Diff'] > 0)
-    ].sort_values('Weight_Diff', ascending=False)
-    return increases.head(n).copy()
+    rows = []
+    for etf in etf_diffs:
+        for status_key in ('new', 'buy'):
+            sub = etf[status_key]
+            for _, r in sub.iterrows():
+                rows.append({
+                    'StockName': r['StockName'],
+                    'Shares_Diff': r['Shares_Diff'],
+                    'Is_New': status_key == 'new',
+                })
 
+    if not rows:
+        return pd.DataFrame(columns=['StockName', 'ETF_Count', 'Avg_Shares_Diff', 'New_Count'])
 
-def get_top_weight_decreases(diff_df: pd.DataFrame, n: int = TOP_N) -> pd.DataFrame:
-    """
-    비중이 급격히 감소한 종목 추출 (제외 종목 제외, 기존 보유 종목 중)
+    df = pd.DataFrame(rows)
+    agg = df.groupby('StockName').agg(
+        ETF_Count=('Shares_Diff', 'count'),
+        Avg_Shares_Diff=('Shares_Diff', 'mean'),
+        New_Count=('Is_New', 'sum'),
+    ).reset_index()
 
-    Args:
-        diff_df: 비중 변동 분석 결과
-        n: 상위 N개
+    agg = agg[agg['ETF_Count'] >= min_etfs]
+    agg['Avg_Shares_Diff'] = agg['Avg_Shares_Diff'].round(1)
+    agg = agg.sort_values(
+        ['ETF_Count', 'Avg_Shares_Diff'], ascending=[False, False]
+    ).reset_index(drop=True)
 
-    Returns:
-        비중 감소 상위 종목 DataFrame
-    """
-    # 기존 보유 종목 중 비중이 감소한 종목만 (완전 제외 제외)
-    decreases = diff_df[
-        (diff_df['Status'] == 'Maintain') &
-        (diff_df['Weight_Diff'] < 0)
-    ].sort_values('Weight_Diff', ascending=True)
-    return decreases.head(n).copy()
+    return agg

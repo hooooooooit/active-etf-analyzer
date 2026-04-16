@@ -1,4 +1,5 @@
 pykrx
 pandas
-fpdf2
-matplotlib
+requests
+python-dotenv
+yfinance
