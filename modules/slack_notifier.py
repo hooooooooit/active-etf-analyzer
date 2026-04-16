@@ -58,6 +58,44 @@ def _divider() -> Dict:
     return {"type": "divider"}
 
 
+def _correction_proximity_block(kospi_stats: Dict) -> List[Dict]:
+    """코스피 급락 통계 기반 조정 접근도 섹션."""
+    if not kospi_stats:
+        return []
+
+    lines = ["*📉 코스피 조정 접근도* _(통계 기반, {:.1f}년 데이터)_".format(
+        kospi_stats["total_years"]
+    )]
+
+    for label, tier in kospi_stats["tiers"].items():
+        days_since = tier["days_since"]
+        avg_gap = tier["avg_gap_cd"]
+        if days_since is None or avg_gap is None:
+            continue
+
+        ratio = days_since / avg_gap
+        pct = min(ratio * 100, 999)
+
+        # 게이지 바 (10칸)
+        filled = min(int(ratio * 10), 10)
+        bar = "█" * filled + "░" * (10 - filled)
+
+        # 위험도 이모지
+        if ratio >= 1.0:
+            emoji = "🔴"
+        elif ratio >= 0.7:
+            emoji = "🟡"
+        else:
+            emoji = "🟢"
+
+        lines.append(
+            f"  {emoji} `{label}` {bar} {pct:.0f}%  "
+            f"— 마지막 {days_since}일 전 (평균 {avg_gap:,}일 간격)"
+        )
+
+    return [{"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}}]
+
+
 def _common_signals_block(common: pd.DataFrame) -> List[Dict]:
     """공통 시그널 섹션. 비어있으면 빈 리스트."""
     if common.empty:
@@ -254,6 +292,7 @@ def build_blocks(
     etf_diffs: List[Dict],
     common_signals: pd.DataFrame,
     newly_listed_holdings: Dict[str, Dict] = None,
+    kospi_drop_stats: Dict = None,
 ) -> List[Dict]:
     """Block Kit 블록 리스트 구성.
 
@@ -263,10 +302,16 @@ def build_blocks(
         etf_diffs: analyze_all_etfs 결과
         common_signals: find_common_signals 결과
         newly_listed_holdings: {ticker: {'name', 'holdings'}} 오늘 상장한 신규 ETF
+        kospi_drop_stats: get_kospi_drop_stats() 결과 (코스피 급락 통계)
     """
     blocks: List[Dict] = [_header_block(date_today)]
 
-    # 신규 상장 ETF 먼저 (오늘만 유효한 정보)
+    # 코스피 조정 접근도 (맨 앞)
+    if kospi_drop_stats:
+        blocks.extend(_correction_proximity_block(kospi_drop_stats))
+        blocks.append(_divider())
+
+    # 신규 상장 ETF (오늘만 유효한 정보)
     if newly_listed_holdings:
         blocks.extend(_newly_listed_blocks(newly_listed_holdings))
         blocks.append(_divider())

@@ -25,6 +25,7 @@ from modules.data_fetcher import (
     find_newly_listed_active_etfs,
 )
 from modules.analyzer import analyze_all_etfs, find_common_signals
+from modules.daily_drop_analyzer import get_kospi_drop_stats
 from modules.slack_notifier import build_blocks, send_to_slack
 
 
@@ -97,8 +98,13 @@ def main(date_arg: str = None, dry_run: bool = False) -> int:
         logger.info("비교 가능한 ETF 없음 — 전송 생략")
         return 0
 
+    # [Step 5.5] 코스피 급락 통계 (조정 접근도)
+    kospi_stats = get_kospi_drop_stats()
+    if kospi_stats:
+        logger.info("코스피 급락 통계 로드 완료")
+
     # [Step 6] Slack 전송
-    blocks = build_blocks(d_today, d_prev, etf_diffs, common, newly_listed_holdings)
+    blocks = build_blocks(d_today, d_prev, etf_diffs, common, newly_listed_holdings, kospi_stats)
 
     if dry_run or not SLACK_WEBHOOK_URL:
         if not SLACK_WEBHOOK_URL and not dry_run:
